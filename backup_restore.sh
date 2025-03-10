@@ -13,124 +13,149 @@ BACKUP_PATH_LOCAL="/root/$BACKUP_FILE"
 wake_nfs() {
     echo "🌐 Risveglio dello storage NFS ($NFS_SERVER)..."
     showmount -e $NFS_SERVER > /dev/null 2>&1
-    ls -lah $NFS_STORAGE > /dev/null 2>&1
+    ls -lah "$NFS_STORAGE" > /dev/null 2>&1
     sleep 10
 }
 
 # Funzione per verificare e creare lo storage NFS in Proxmox
 create_nfs_storage() {
     echo "🔍 Controllo se lo storage NFS ($NFS_STORAGE) è già configurato su Proxmox..."
+    # Risveglia lo storage prima della creazione
     wake_nfs
+
     if ! pvesm status | grep -q "proxmox-bk"; then
         echo "⚙️ Lo storage NFS non è presente, lo stiamo creando..."
-        pvesm add nfs proxmox-bk --server $NFS_SERVER --export $NFS_EXPORT --options vers=3 --content backup,iso
+        pvesm add nfs proxmox-bk --server "$NFS_SERVER" --export "$NFS_EXPORT" --options vers=3 --content backup,iso
         echo "✅ Storage NFS creato con successo!"
     else
         echo "✅ Lo storage NFS è già presente."
     fi
 }
 
-# Funzione per installare pacchetti necessari
+# Funzione per installare pacchetti necessari, incluse le dipendenze Python tramite apt
 install_packages() {
     echo "📦 Installazione pacchetti necessari..."
     apt update && apt upgrade -y
-    apt install -y postfix python3 python3-pip mosquitto-clients systemd nfs-common mailutils
+    apt install -y postfix python3 python3-pip mosquitto-clients crowdsec crowdsec-firewall-bouncer systemd nfs-common iptables ipset python3-paho-mqtt python3-requests
     echo "✅ Pacchetti installati!"
-    pip3 install paho-mqtt requests smtplib
+
+    # Abilita il bouncer per bloccare gli IP malevoli
+    systemctl enable crowdsec
+    systemctl enable crowdsec-firewall-bouncer
+    systemctl start crowdsec
+    systemctl start crowdsec-firewall-bouncer
+    echo "✅ CrowdSec e il firewall bouncer sono attivati!"
 }
 
 # Funzione per creare il backup
 backup() {
     echo "📦 Creazione del backup in corso..."
-
-    # **PULIZIA DELLA DIRECTORY DI BACKUP!**
-    rm -rf $BACKUP_DIR
-
-    # Creazione delle directory necessarie per il backup
-    mkdir -p $BACKUP_DIR/config
-    mkdir -p $BACKUP_DIR/scripts
-    mkdir -p $BACKUP_DIR/cron
-    mkdir -p $BACKUP_DIR/systemd
-    mkdir -p $BACKUP_DIR/root_scripts
+    
+    mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/scripts" "$BACKUP_DIR/cron" "$BACKUP_DIR/systemd" "$BACKUP_DIR/firewall"
 
     # Backup di Postfix
-    cp -r /etc/postfix $BACKUP_DIR/config/
-    cp -r /etc/aliases $BACKUP_DIR/config/
-    cp -r /etc/ssl/certs/Entrust_Root_Certification_Authority.pem $BACKUP_DIR/config/
-    cp /etc/postfix/sasl_passwd $BACKUP_DIR/config/ 2>/dev/null
-    cp /etc/postfix/sasl_passwd.db $BACKUP_DIR/config/ 2>/dev/null
+    cp -r /etc/postfix "$BACKUP_DIR/config/"
+    cp -r /etc/aliases "$BACKUP_DIR/config/"
+    cp -r /etc/ssl/certs/Entrust_Root_Certification_Authority.pem "$BACKUP_DIR/config/"
+    cp /etc/postfix/sasl_passwd "$BACKUP_DIR/config/" 2>/dev/null
+    cp /etc/postfix/sasl_passwd.db "$BACKUP_DIR/config/" 2>/dev/null
 
     # Backup degli script personalizzati in /usr/local/bin/
-    cp -r /usr/local/bin/* $BACKUP_DIR/scripts/
-
-    # Backup dello script Proxmox Health Check in /root/
-    cp /root/proxmox_health_check.sh $BACKUP_DIR/root_scripts/
+    cp -r /usr/local/bin/* "$BACKUP_DIR/scripts/"
 
     # Backup del crontab
-    crontab -l > $BACKUP_DIR/cron/root_crontab
+    crontab -l > "$BACKUP_DIR/cron/root_crontab"
 
     # Backup del servizio systemd
-    cp /etc/systemd/system/iniziomieiscript.service $BACKUP_DIR/systemd/
+    cp /etc/systemd/system/iniziomieiscript.service "$BACKUP_DIR/systemd/"
+
+    # Backup di iptables
+    iptables-save > "$BACKUP_DIR/firewall/iptables.rules"
+
+    # Backup delle blacklist di CrowdSec
+    cscli decisions export -o json > "$BACKUP_DIR/firewall/crowdsec-decisions.json"
+
+    # Backup della configurazione di CrowdSec
+    cp -r /etc/crowdsec/ "$BACKUP_DIR/firewall/crowdsec-config/"
 
     # Creazione dell'archivio compresso con la data
-    tar -czvf $BACKUP_PATH_LOCAL -C /root backup_completo
+    tar -czvf "$BACKUP_PATH_LOCAL" -C /root backup_completo
     echo "✅ Backup creato: $BACKUP_PATH_LOCAL"
 
     # Copia su NFS dopo il wake-up
     wake_nfs
-    cp $BACKUP_PATH_LOCAL $NFS_STORAGE/
+    cp "$BACKUP_PATH_LOCAL" "$NFS_STORAGE/"
     echo "✅ Backup copiato su NFS: $NFS_STORAGE/$BACKUP_FILE"
 }
 
-# Funzione per trovare il file di backup più recente su NFS
+# Funzione per trovare il file di backup più recente
 find_latest_backup() {
-    echo "🔍 Ricerca dell'ultimo file di backup su NFS..."
-    LATEST_BACKUP=$(ls -t $NFS_STORAGE/backup_scrpt_servizi_*.tar.gz 2>/dev/null | head -n 1)
-    if [[ -z "$LATEST_BACKUP" ]]; then
-        echo "❌ Nessun file di backup trovato su NFS!"
+    LATEST_BACKUP=$(ls -t "$NFS_STORAGE"/backup_scrpt_servizi_*.tar.gz 2>/dev/null | head -n1)
+    if [ -z "$LATEST_BACKUP" ]; then
+        echo "❌ Nessun file di backup trovato in $NFS_STORAGE"
         exit 1
     fi
-    echo "📂 Ultimo file di backup trovato: $LATEST_BACKUP"
+    echo "✅ File di backup più recente trovato: $LATEST_BACKUP"
 }
 
 # Funzione per ripristinare il backup
 restore() {
     echo "♻️ Inizio procedura di ripristino..."
     
+    # Installazione pacchetti necessari
     install_packages
+
+    # Creazione automatica dello storage NFS in Proxmox se non esiste
     create_nfs_storage
+
+    # Trova il file di backup più recente
     find_latest_backup
 
     # Estrai il backup dalla posizione NFS
-    tar -xzvf $LATEST_BACKUP -C /
+    tar -xzvf "$LATEST_BACKUP" -C /
 
     # Ripristino Postfix
-    cp -r $BACKUP_DIR/config/postfix /etc/
-    cp -r $BACKUP_DIR/config/aliases /etc/
-    cp -r $BACKUP_DIR/config/Entrust_Root_Certification_Authority.pem /etc/ssl/certs/
-    cp $BACKUP_DIR/config/sasl_passwd /etc/postfix/ 2>/dev/null
-    cp $BACKUP_DIR/config/sasl_passwd.db /etc/postfix/ 2>/dev/null
+    cp -r "$BACKUP_DIR/config/postfix" /etc/
+    cp -r "$BACKUP_DIR/config/aliases" /etc/
+    cp -r "$BACKUP_DIR/config/Entrust_Root_Certification_Authority.pem" /etc/ssl/certs/
+    cp "$BACKUP_DIR/config/sasl_passwd" /etc/postfix/ 2>/dev/null
+    cp "$BACKUP_DIR/config/sasl_passwd.db" /etc/postfix/ 2>/dev/null
     postmap /etc/postfix/sasl_passwd 2>/dev/null
     systemctl restart postfix
 
+    # Ripristino iptables
+    iptables-restore < "$BACKUP_DIR/firewall/iptables.rules"
+
+    # Ripristino delle blacklist di CrowdSec
+    cscli decisions import -f "$BACKUP_DIR/firewall/crowdsec-decisions.json"
+
+    # Ripristino della configurazione di CrowdSec
+    cp -r "$BACKUP_DIR/firewall/crowdsec-config/" /etc/crowdsec/
+    systemctl restart crowdsec
+    systemctl restart crowdsec-firewall-bouncer
+
     # Ripristino degli script personalizzati in /usr/local/bin/
-    cp -r $BACKUP_DIR/scripts/* /usr/local/bin/
-    chmod +x /usr/local/bin/*.sh
-    chmod +x /usr/local/bin/*.py
+    if [ -d "$BACKUP_DIR/scripts" ]; then
+        cp -r "$BACKUP_DIR/scripts/." /usr/local/bin/
+        # Imposta i permessi eseguibili solo sui file .sh e .py presenti
+        find /usr/local/bin -maxdepth 1 -type f -name "*.sh" -exec chmod +x {} \;
+        find /usr/local/bin -maxdepth 1 -type f -name "*.py" -exec chmod +x {} \;
+    else
+        echo "❌ Directory degli script non trovata in $BACKUP_DIR/scripts"
+    fi
 
-    # Ripristino dello script Proxmox Health Check
-    cp $BACKUP_DIR/root_scripts/proxmox_health_check.sh /root/
-    chmod +x /root/proxmox_health_check.sh
-
-    # Ripristino del crontab e aggiunta di Proxmox Health Check
-    crontab $BACKUP_DIR/cron/root_crontab
-    (crontab -l ; echo "0 * * * * /root/proxmox_health_check.sh") | sort -u | crontab -
+    # Ripristino del crontab
+    crontab "$BACKUP_DIR/cron/root_crontab"
 
     # Ripristino del servizio systemd
-    cp $BACKUP_DIR/systemd/iniziomieiscript.service /etc/systemd/system/
-    systemctl daemon-reload
-    systemctl enable iniziomieiscript.service
-    systemctl start iniziomieiscript.service
+    if [ -f "$BACKUP_DIR/systemd/iniziomieiscript.service" ]; then
+        cp "$BACKUP_DIR/systemd/iniziomieiscript.service" /etc/systemd/system/
+        systemctl daemon-reload
+        systemctl enable iniziomieiscript.service
+        systemctl start iniziomieiscript.service
+    else
+        echo "❌ File di servizio iniziomieiscript.service non trovato in $BACKUP_DIR/systemd"
+    fi
 
     echo "✅ Ripristino completato!"
 }
