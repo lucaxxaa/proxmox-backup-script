@@ -20,10 +20,7 @@ wake_nfs() {
 # Funzione per verificare e creare lo storage NFS in Proxmox
 create_nfs_storage() {
     echo "🔍 Controllo se lo storage NFS ($NFS_STORAGE) è già configurato su Proxmox..."
-    
-    # Risveglia lo storage prima della creazione
     wake_nfs
-
     if ! pvesm status | grep -q "proxmox-bk"; then
         echo "⚙️ Lo storage NFS non è presente, lo stiamo creando..."
         pvesm add nfs proxmox-bk --server $NFS_SERVER --export $NFS_EXPORT --options vers=3 --content backup,iso
@@ -37,29 +34,24 @@ create_nfs_storage() {
 install_packages() {
     echo "📦 Installazione pacchetti necessari..."
     apt update && apt upgrade -y
-    apt install -y postfix python3 python3-pip mosquitto-clients crowdsec crowdsec-firewall-bouncer systemd nfs-common iptables ipset
+    apt install -y postfix python3 python3-pip mosquitto-clients systemd nfs-common mailutils
     echo "✅ Pacchetti installati!"
-
-    # Abilita il bouncer per bloccare gli IP malevoli
-    systemctl enable crowdsec
-    systemctl enable crowdsec-firewall-bouncer
-    systemctl start crowdsec
-    systemctl start crowdsec-firewall-bouncer
-    echo "✅ CrowdSec e il firewall bouncer sono attivati!"
-
-    # Installazione librerie Python necessarie
     pip3 install paho-mqtt requests smtplib
 }
 
 # Funzione per creare il backup
 backup() {
     echo "📦 Creazione del backup in corso..."
-    
+
+    # **PULIZIA DELLA DIRECTORY DI BACKUP!**
+    rm -rf $BACKUP_DIR
+
+    # Creazione delle directory necessarie per il backup
     mkdir -p $BACKUP_DIR/config
     mkdir -p $BACKUP_DIR/scripts
     mkdir -p $BACKUP_DIR/cron
     mkdir -p $BACKUP_DIR/systemd
-    mkdir -p $BACKUP_DIR/firewall
+    mkdir -p $BACKUP_DIR/root_scripts
 
     # Backup di Postfix
     cp -r /etc/postfix $BACKUP_DIR/config/
@@ -71,20 +63,14 @@ backup() {
     # Backup degli script personalizzati in /usr/local/bin/
     cp -r /usr/local/bin/* $BACKUP_DIR/scripts/
 
+    # Backup dello script Proxmox Health Check in /root/
+    cp /root/proxmox_health_check.sh $BACKUP_DIR/root_scripts/
+
     # Backup del crontab
     crontab -l > $BACKUP_DIR/cron/root_crontab
 
     # Backup del servizio systemd
     cp /etc/systemd/system/iniziomieiscript.service $BACKUP_DIR/systemd/
-
-    # 🔥 Backup di iptables
-    iptables-save > $BACKUP_DIR/firewall/iptables.rules
-
-    # 🔥 Backup delle blacklist di CrowdSec
-    cscli decisions export -o json > $BACKUP_DIR/firewall/crowdsec-decisions.json
-
-    # 🔥 Backup della configurazione di CrowdSec
-    cp -r /etc/crowdsec/ $BACKUP_DIR/firewall/crowdsec-config/
 
     # Creazione dell'archivio compresso con la data
     tar -czvf $BACKUP_PATH_LOCAL -C /root backup_completo
@@ -96,17 +82,23 @@ backup() {
     echo "✅ Backup copiato su NFS: $NFS_STORAGE/$BACKUP_FILE"
 }
 
+# Funzione per trovare il file di backup più recente su NFS
+find_latest_backup() {
+    echo "🔍 Ricerca dell'ultimo file di backup su NFS..."
+    LATEST_BACKUP=$(ls -t $NFS_STORAGE/backup_scrpt_servizi_*.tar.gz 2>/dev/null | head -n 1)
+    if [[ -z "$LATEST_BACKUP" ]]; then
+        echo "❌ Nessun file di backup trovato su NFS!"
+        exit 1
+    fi
+    echo "📂 Ultimo file di backup trovato: $LATEST_BACKUP"
+}
+
 # Funzione per ripristinare il backup
 restore() {
     echo "♻️ Inizio procedura di ripristino..."
     
-    # Installazione pacchetti necessari
     install_packages
-
-    # Creazione automatica dello storage NFS in Proxmox se non esiste
     create_nfs_storage
-
-    # Trova il file di backup più recente
     find_latest_backup
 
     # Estrai il backup dalla posizione NFS
@@ -121,24 +113,18 @@ restore() {
     postmap /etc/postfix/sasl_passwd 2>/dev/null
     systemctl restart postfix
 
-    # Ripristino iptables
-    iptables-restore < $BACKUP_DIR/firewall/iptables.rules
-
-    # Ripristino delle blacklist di CrowdSec
-    cscli decisions import -f $BACKUP_DIR/firewall/crowdsec-decisions.json
-
-    # Ripristino della configurazione di CrowdSec
-    cp -r $BACKUP_DIR/firewall/crowdsec-config/ /etc/crowdsec/
-    systemctl restart crowdsec
-    systemctl restart crowdsec-firewall-bouncer
-
     # Ripristino degli script personalizzati in /usr/local/bin/
     cp -r $BACKUP_DIR/scripts/* /usr/local/bin/
     chmod +x /usr/local/bin/*.sh
     chmod +x /usr/local/bin/*.py
 
-    # Ripristino del crontab
+    # Ripristino dello script Proxmox Health Check
+    cp $BACKUP_DIR/root_scripts/proxmox_health_check.sh /root/
+    chmod +x /root/proxmox_health_check.sh
+
+    # Ripristino del crontab e aggiunta di Proxmox Health Check
     crontab $BACKUP_DIR/cron/root_crontab
+    (crontab -l ; echo "0 * * * * /root/proxmox_health_check.sh") | sort -u | crontab -
 
     # Ripristino del servizio systemd
     cp $BACKUP_DIR/systemd/iniziomieiscript.service /etc/systemd/system/
