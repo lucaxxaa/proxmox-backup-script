@@ -68,9 +68,8 @@ backup() {
     cp /etc/postfix/sasl_passwd $BACKUP_DIR/config/ 2>/dev/null
     cp /etc/postfix/sasl_passwd.db $BACKUP_DIR/config/ 2>/dev/null
 
-    # Backup degli script Python
-    cp /root/crowdsec_notify.py $BACKUP_DIR/scripts/
-    cp /usr/local/bin/mqtt_scripts/inviotemphomeassistant.py $BACKUP_DIR/scripts/
+    # Backup degli script personalizzati in /usr/local/bin/
+    cp -r /usr/local/bin/* $BACKUP_DIR/scripts/
 
     # Backup del crontab
     crontab -l > $BACKUP_DIR/cron/root_crontab
@@ -133,9 +132,10 @@ restore() {
     systemctl restart crowdsec
     systemctl restart crowdsec-firewall-bouncer
 
-    # Ripristino degli script Python
-    cp -r $BACKUP_DIR/scripts/* /usr/local/bin/mqtt_scripts/
-    chmod +x /usr/local/bin/mqtt_scripts/*.py
+    # Ripristino degli script personalizzati in /usr/local/bin/
+    cp -r $BACKUP_DIR/scripts/* /usr/local/bin/
+    chmod +x /usr/local/bin/*.sh
+    chmod +x /usr/local/bin/*.py
 
     # Ripristino del crontab
     crontab $BACKUP_DIR/cron/root_crontab
