@@ -30,6 +30,9 @@ install_packages() {
 
 backup() {
     echo "Inizio backup delle configurazioni..."
+    
+    # Auto-pulizia della directory temporanea
+    rm -rf "$BACKUP_DIR"
     mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/scripts" "$BACKUP_DIR/cron" "$BACKUP_DIR/systemd"
 
     # --- CORE PROXMOX ---
