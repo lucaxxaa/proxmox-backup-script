@@ -33,7 +33,7 @@ backup() {
     
     # Auto-pulizia della directory temporanea
     rm -rf "$BACKUP_DIR"
-    mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/scripts" "$BACKUP_DIR/cron" "$BACKUP_DIR/systemd"
+    mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/scripts" "$BACKUP_DIR/cron" "$BACKUP_DIR/systemd" "$BACKUP_DIR/root_scripts"
 
     # --- CORE PROXMOX ---
     cp /etc/network/interfaces "$BACKUP_DIR/config/"
@@ -48,10 +48,14 @@ backup() {
     cp -P /etc/ssl/certs/Entrust_Root_Certification_Authority.pem "$BACKUP_DIR/config/"
     cp /etc/postfix/sasl_passwd* "$BACKUP_DIR/config/" 2>/dev/null
 
-    # --- SCRIPT E AUTOMAZIONI ---
+    # --- SCRIPT IN /usr/local/bin/ E SYSTEMD ---
     cp -r /usr/local/bin/* "$BACKUP_DIR/scripts/" 2>/dev/null
-    crontab -l > "$BACKUP_DIR/cron/root_crontab" 2>/dev/null
     cp /etc/systemd/system/iniziomieiscript.service "$BACKUP_DIR/systemd/" 2>/dev/null
+
+    # --- SCRIPT IN /root/ E AUTOMAZIONI CRON ---
+    # Salva script vitali per Proxmox e ZFS situati nella cartella root
+    cp /root/*.sh "$BACKUP_DIR/root_scripts/" 2>/dev/null
+    crontab -l > "$BACKUP_DIR/cron/root_crontab" 2>/dev/null
 
     # --- CREAZIONE E INVIO ARCHIVIO ---
     tar -czvf "$BACKUP_PATH_LOCAL" -C /root backup_completo
@@ -93,18 +97,24 @@ restore() {
     postmap /etc/postfix/sasl_passwd 2>/dev/null
     systemctl restart postfix
 
-    # --- RIPRISTINO SCRIPT E AUTOMAZIONI ---
-    cp -r "$BACKUP_DIR/scripts/." /usr/local/bin/
+    # --- RIPRISTINO SCRIPT IN /usr/local/bin/ ---
+    cp -r "$BACKUP_DIR/scripts/." /usr/local/bin/ 2>/dev/null
     find /usr/local/bin -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) -exec chmod +x {} \;
+
+    # --- RIPRISTINO SCRIPT IN /root/ E CRONTAB ---
+    # Ripristina gli script vitali nella home e il crontab che li avvia
+    cp -r "$BACKUP_DIR/root_scripts/." /root/ 2>/dev/null
+    find /root -maxdepth 1 -type f -name "*.sh" -exec chmod +x {} \;
     crontab "$BACKUP_DIR/cron/root_crontab" 2>/dev/null
 
+    # --- RIPRISTINO SYSTEMD ---
     cp "$BACKUP_DIR/systemd/iniziomieiscript.service" /etc/systemd/system/ 2>/dev/null
     systemctl daemon-reload
-    systemctl enable iniziomieiscript.service
-    systemctl start iniziomieiscript.service
+    systemctl enable iniziomieiscript.service 2>/dev/null
+    systemctl start iniziomieiscript.service 2>/dev/null
 
     echo "✅ Ripristino configurazioni completato!"
-    echo "⚠️ RIAVVIA IL SERVER ORA PER APPLICARE LE CONFIGURAZIONI DI RETE (vmbr0, vmbr1, vmbr2). ⚠️"
+    echo "⚠️ RIAVVIA IL SERVER ORA PER APPLICARE LE CONFIGURAZIONI DI RETE E FIREWALL. ⚠️"
 }
 
 echo "1) Backup  2) Ripristino  3) Esci"
